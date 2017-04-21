@@ -2,6 +2,8 @@ from string import punctuation
 import pdb
 import itertools as it
 import random
+import os
+import pickle
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -23,8 +25,15 @@ stop_words = [
     'While','This']
 
 #-------------------------------------------------------------------------------
-def text_to_wordlist(text, remove_stop_words=True, stem_words=False):
-    # Clean the text, with the option to remove stop_words and to stem words.
+def text_to_wordlist(text, remove_stop_words=False, stem_words=False, lower=True):
+    """Clean the text, with the option to remove stop_words and to stem words.
+
+        Inputs:
+            text: string object
+
+        Return:
+            string of processed text
+    """
 
     # Clean the text
     text = re.sub(r"[^A-Za-z0-9]", " ", text)
@@ -99,8 +108,9 @@ def text_to_wordlist(text, remove_stop_words=True, stem_words=False):
         stemmed_words = [stemmer.stem(word) for word in text]
         text = " ".join(stemmed_words)
     
-    # Return a list of words
-    return(text)
+    if lower:
+        text = text.lower()
+    return text
 
 
 
@@ -118,20 +128,18 @@ class BatchProvider(object):
 
     #---------------------------------------------------------------------------
     def sample_batch(self, batch_size):
-        """ questions has shape batch_size x max_len x n_features"""
-        batch = {}
+        """ samples batch from dataset
+
+            Return:
+                dict with next fields:
+                questions_1 - array of indexes in embedding as_matrix
+                    shape is batch_size x max_len
+                seq_lengths_1 - array with lenghs of sentences
+                    shape is batch_size
+        """
+
         data = self.data.sample(batch_size)
-
-        questions, lengths = self.zero_pad(data['question1'])
-        batch['seq_lengths_1'] = lengths.astype(np.int32)
-        batch['questions_1'] = questions.astype(np.float32)
-
-        questions, lengths = self.zero_pad(data['question2'])
-        batch['seq_lengths_2'] = lengths.astype(np.int32)
-        batch['questions_2'] = questions.astype(np.float32)
-
-        if 'is_duplicate' in self.data.columns.values:
-            batch['targets'] = data['is_duplicate'].as_matrix().astype(np.float32)
+        batch = self.process_batch(data)
         return batch
 
     #---------------------------------------------------------------------------
@@ -173,9 +181,9 @@ class BatchProvider(object):
 
     #---------------------------------------------------------------------------
     def text_to_vectorlist(self, text):
-        text = text_to_wordlist(text, remove_stop_words=False)
+        text = text_to_wordlist(text)
         list_of_w = text.split(' ')
-        list_of_v = [self.loader_class.w2v_model.word_vec(word, use_norm=False)\
+        list_of_v = [self.loader_class.w2v_model.word_vec(word)\
             for word in list_of_w if word in self.loader_class.w2v_model.vocab]
         return list_of_v
 
@@ -183,9 +191,22 @@ class BatchProvider(object):
 
 class DataProvider(object):
 
-    def __init__(self, path_to_csv, path_to_w2v, test_size):
+    def __init__(self, path_to_csv, path_to_w2v, test_size, path_to_vocab):
         self.data = pd.read_csv(path_to_csv)
         self.data = self.data.fillna('empty')
+        if os.path.isfile(path_to_vocab):
+            print('Load vocab', end='...')
+            with open('dataset/vocab.pickle', 'rb') as f:
+                self.vocab = pickle.load(f)
+            print('len of vocab = {}'.format(len(self.vocab)), end='  ')
+            print('Done')
+        else:
+            print('Processing vocab', end='...')
+            self.vocab = self.get_vocab(self.data['question1'])
+            with open('dataset/vocab.pickle', 'wb') as f:
+                pickle.dump(self.vocab, f)
+            print('len of vocab = {}'.format(len(self.vocab)), end='  ')
+            print('Done')
         if test_size>0:
             self.train_data, self.test_data = train_test_split(self.data,
             test_size=test_size, random_state=123)
@@ -196,30 +217,72 @@ class DataProvider(object):
             self.test_data = np.empty([0])
         print('train_data', self.train_data.shape)
         print('test_data', self.test_data.shape)
+        print('Load vord to vec', end='...')
         self.w2v_model = KeyedVectors.load_word2vec_format(path_to_w2v, binary=True)
+        print('Done')
+
 
         self.train = BatchProvider(data=self.train_data, loader_class=self)
         if test_size > 0:
             self.test = BatchProvider(data=self.test_data, loader_class=self)
 
     def save_vectors_as_words(self, path_to_file, lists_of_v):
-        # lists_of_v is list of list of vectors
-        lists_of_w = [[self.w2v_model.most_similar([w], topn=1)[0][0] for w in s]\
-            for s in lists_of_v]
+        """ Save results to txt file
+
+        Args:
+            path_to_file: string, file to save
+            lists_of_v: list of list of vectors
+        """
+        lists_of_w = []
+        for s in lists_of_v:
+            sentence = []
+            for v in s:
+                most_similar = self.w2v_model.most_similar([v], topn=1000)
+                most_similar = [i[0] for i in most_similar]
+                for i, w in enumerate(most_similar):
+                    if w in self.vocab:
+                        sentence.append(w)
+                        break
+                    if i == 999:
+                        print('Not find similar word')
+                        sentence.append('not_similar')
+                        break
+            lists_of_w.append(sentence)
 
         with open(path_to_file, 'w') as f:
             for s in lists_of_w:
                 [f.write(w+' ') for w in s]
                 f.write('\n')
 
+    def get_vocab(self, data):
+        """ Return list of unique words from data
+
+        Args:
+            data: iterable object of sentences (string)
+
+        Returns:
+            vocab: list of unique words
+        """
+        vocab = set()
+        for s in data:
+            text = text_to_wordlist(s)
+            list_of_w = text.split(' ')
+            vocab = vocab.union(set(list_of_w))
+
+        return vocab
+
+
+
 
 
 
 #-------------------------------------------------------------------------------
 if __name__ == '__main__':
-    data_provider = DataProvider(path_to_csv='dataset/temp.csv',
+    """
+    data_provider = DataProvider(path_to_csv='dataset/set_for_encoding.csv',
         path_to_w2v='embeddings/GoogleNews-vectors-negative300.bin',
-        test_size=0.2) 
+        test_size=0.2, path_to_vocab='dataset/vocab.pickle') 
+    """
 
     """
     for i in range(10):
@@ -231,7 +294,7 @@ if __name__ == '__main__':
         print(i)
         data_provider.train.next_batch(16)
         data_provider.test.next_batch(16)
-    """
+    
     batch_size = 2
     batch = data_provider.train.next_batch(batch_size)
     res = batch['questions_1']
@@ -239,4 +302,12 @@ if __name__ == '__main__':
     result += [[w for w in res[i,:batch['seq_lengths_1'][i],:]]\
     for i in range(batch_size)]
     data_provider.save_vectors_as_words('test.txt', result)
+    """
 
+    """
+    wordlist = text_to_wordlist('What is the story of Kohinoor (Koh-i-Noor) Diamond?')
+    print(wordlist)
+    print(type(wordlist))
+    """
+
+    # print(len(data_provider.vocab))
